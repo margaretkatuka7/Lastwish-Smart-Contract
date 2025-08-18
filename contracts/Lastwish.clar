@@ -15,6 +15,12 @@
 (define-constant ERR_INSUFFICIENT_WITNESSES (err u113))
 (define-constant ERR_WITNESS_ALREADY_VOTED (err u114))
 (define-constant ERR_INVALID_DISPUTE_TYPE (err u115))
+(define-constant ERR_DISTRIBUTION_NOT_FOUND (err u116))
+(define-constant ERR_DISTRIBUTION_EXHAUSTED (err u117))
+(define-constant ERR_DISTRIBUTION_LOCKED (err u118))
+(define-constant ERR_INVALID_SCHEDULE (err u119))
+(define-constant ERR_SCHEDULE_NOT_FOUND (err u120))
+(define-constant ERR_INVALID_DISTRIBUTION_TYPE (err u121))
 
 (define-map wills
   { testator: principal }
@@ -75,6 +81,39 @@
 )
 
 (define-data-var next-dispute-id uint u1)
+
+(define-map distribution-schedules
+  { testator: principal, beneficiary: principal }
+  {
+    total-amount: uint,
+    remaining-amount: uint,
+    installment-amount: uint,
+    release-interval: uint,
+    next-release-block: uint,
+    final-release-block: uint,
+    distribution-type: uint,
+    is-active: bool,
+    created-at: uint
+  }
+)
+
+(define-map distribution-history
+  { testator: principal, beneficiary: principal, release-id: uint }
+  { amount: uint, released-at: uint, block-height: uint }
+)
+
+(define-map beneficiary-conditions
+  { testator: principal, beneficiary: principal }
+  {
+    min-age-requirement: uint,
+    achievement-required: bool,
+    external-approval-required: bool,
+    conditions-met: bool,
+    verified-at: uint
+  }
+)
+
+(define-data-var next-release-id uint u1)
 
 (define-public (create-will 
   (beneficiaries (list 10 principal))
@@ -493,4 +532,279 @@
 
 (define-read-only (get-next-dispute-id)
   (var-get next-dispute-id)
+)
+
+(define-public (create-distribution-schedule 
+  (beneficiary principal) 
+  (total-amount uint) 
+  (installment-amount uint) 
+  (release-interval uint) 
+  (distribution-type uint))
+  (let (
+    (testator tx-sender)
+    (current-block stacks-block-height)
+    (will-data (unwrap! (map-get? wills { testator: testator }) ERR_WILL_NOT_FOUND))
+    (inheritance-amount (unwrap! (get-inheritance-amount testator beneficiary) ERR_INVALID_BENEFICIARY))
+    (final-release-block (+ current-block (* release-interval (/ total-amount installment-amount))))
+  )
+    (asserts! (get is-active will-data) ERR_WILL_NOT_FOUND)
+    (asserts! (> total-amount u0) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (> installment-amount u0) ERR_INVALID_SCHEDULE)
+    (asserts! (> release-interval u0) ERR_INVALID_SCHEDULE)
+    (asserts! (<= total-amount inheritance-amount) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (or (is-eq distribution-type u1) (is-eq distribution-type u2) (is-eq distribution-type u3)) ERR_INVALID_DISTRIBUTION_TYPE)
+    (asserts! (is-none (map-get? distribution-schedules { testator: testator, beneficiary: beneficiary })) ERR_DISTRIBUTION_NOT_FOUND)
+    
+    (map-set distribution-schedules
+      { testator: testator, beneficiary: beneficiary }
+      {
+        total-amount: total-amount,
+        remaining-amount: total-amount,
+        installment-amount: installment-amount,
+        release-interval: release-interval,
+        next-release-block: (+ current-block release-interval),
+        final-release-block: final-release-block,
+        distribution-type: distribution-type,
+        is-active: true,
+        created-at: current-block
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (set-beneficiary-conditions 
+  (beneficiary principal) 
+  (min-age uint) 
+  (achievement-required bool) 
+  (external-approval bool))
+  (let (
+    (testator tx-sender)
+    (current-block stacks-block-height)
+    (will-data (unwrap! (map-get? wills { testator: testator }) ERR_WILL_NOT_FOUND))
+  )
+    (asserts! (get is-active will-data) ERR_WILL_NOT_FOUND)
+    (asserts! (is-some (get-inheritance-amount testator beneficiary)) ERR_INVALID_BENEFICIARY)
+    
+    (map-set beneficiary-conditions
+      { testator: testator, beneficiary: beneficiary }
+      {
+        min-age-requirement: min-age,
+        achievement-required: achievement-required,
+        external-approval-required: external-approval,
+        conditions-met: false,
+        verified-at: u0
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (verify-beneficiary-conditions (testator principal) (beneficiary principal))
+  (let (
+    (current-block stacks-block-height)
+    (conditions (unwrap! (map-get? beneficiary-conditions { testator: testator, beneficiary: beneficiary }) ERR_SCHEDULE_NOT_FOUND))
+    (will-data (unwrap! (map-get? wills { testator: testator }) ERR_WILL_NOT_FOUND))
+    (status (unwrap! (map-get? testator-status { testator: testator }) ERR_WILL_NOT_FOUND))
+  )
+    (asserts! (get is-active will-data) ERR_WILL_NOT_FOUND)
+    (asserts! (get is-deceased status) ERR_NOT_DECEASED)
+    (asserts! (not (get conditions-met conditions)) ERR_ALREADY_CLAIMED)
+    
+    (map-set beneficiary-conditions
+      { testator: testator, beneficiary: beneficiary }
+      (merge conditions { conditions-met: true, verified-at: current-block })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (claim-scheduled-distribution (testator principal))
+  (let (
+    (beneficiary tx-sender)
+    (current-block stacks-block-height)
+    (distribution (unwrap! (map-get? distribution-schedules { testator: testator, beneficiary: beneficiary }) ERR_DISTRIBUTION_NOT_FOUND))
+    (conditions (map-get? beneficiary-conditions { testator: testator, beneficiary: beneficiary }))
+    (will-data (unwrap! (map-get? wills { testator: testator }) ERR_WILL_NOT_FOUND))
+    (status (unwrap! (map-get? testator-status { testator: testator }) ERR_WILL_NOT_FOUND))
+    (release-id (var-get next-release-id))
+    (claimable-amount (get installment-amount distribution))
+    (remaining-amount (get remaining-amount distribution))
+  )
+    (asserts! (get is-active distribution) ERR_DISTRIBUTION_NOT_FOUND)
+    (asserts! (get is-active will-data) ERR_WILL_NOT_FOUND)
+    (asserts! (get is-deceased status) ERR_NOT_DECEASED)
+    (asserts! (> remaining-amount u0) ERR_DISTRIBUTION_EXHAUSTED)
+    (asserts! (>= current-block (get next-release-block distribution)) ERR_DISTRIBUTION_LOCKED)
+    
+    (match conditions
+      condition-data
+        (asserts! (get conditions-met condition-data) ERR_DISTRIBUTION_LOCKED)
+        true
+    )
+    
+    (let (
+      (final-amount (if (< remaining-amount claimable-amount) remaining-amount claimable-amount))
+      (new-remaining (- remaining-amount final-amount))
+      (new-next-release (+ current-block (get release-interval distribution)))
+    )
+      (try! (as-contract (stx-transfer? final-amount tx-sender beneficiary)))
+      
+      (map-set distribution-schedules
+        { testator: testator, beneficiary: beneficiary }
+        (merge distribution {
+          remaining-amount: new-remaining,
+          next-release-block: (if (> new-remaining u0) new-next-release u0),
+          is-active: (> new-remaining u0)
+        })
+      )
+      
+      (map-set distribution-history
+        { testator: testator, beneficiary: beneficiary, release-id: release-id }
+        { amount: final-amount, released-at: current-block, block-height: current-block }
+      )
+      
+      (var-set next-release-id (+ release-id u1))
+      (ok final-amount)
+    )
+  )
+)
+
+(define-public (modify-distribution-schedule 
+  (beneficiary principal) 
+  (new-installment-amount uint) 
+  (new-release-interval uint))
+  (let (
+    (testator tx-sender)
+    (current-block stacks-block-height)
+    (distribution (unwrap! (map-get? distribution-schedules { testator: testator, beneficiary: beneficiary }) ERR_DISTRIBUTION_NOT_FOUND))
+    (will-data (unwrap! (map-get? wills { testator: testator }) ERR_WILL_NOT_FOUND))
+    (status (unwrap! (map-get? testator-status { testator: testator }) ERR_WILL_NOT_FOUND))
+  )
+    (asserts! (get is-active distribution) ERR_DISTRIBUTION_NOT_FOUND)
+    (asserts! (get is-active will-data) ERR_WILL_NOT_FOUND)
+    (asserts! (not (get is-deceased status)) ERR_NOT_DECEASED)
+    (asserts! (> new-installment-amount u0) ERR_INVALID_SCHEDULE)
+    (asserts! (> new-release-interval u0) ERR_INVALID_SCHEDULE)
+    
+    (map-set distribution-schedules
+      { testator: testator, beneficiary: beneficiary }
+      (merge distribution {
+        installment-amount: new-installment-amount,
+        release-interval: new-release-interval,
+        next-release-block: (+ current-block new-release-interval)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (cancel-distribution-schedule (beneficiary principal))
+  (let (
+    (testator tx-sender)
+    (distribution (unwrap! (map-get? distribution-schedules { testator: testator, beneficiary: beneficiary }) ERR_DISTRIBUTION_NOT_FOUND))
+    (will-data (unwrap! (map-get? wills { testator: testator }) ERR_WILL_NOT_FOUND))
+    (status (unwrap! (map-get? testator-status { testator: testator }) ERR_WILL_NOT_FOUND))
+    (remaining-amount (get remaining-amount distribution))
+  )
+    (asserts! (get is-active distribution) ERR_DISTRIBUTION_NOT_FOUND)
+    (asserts! (get is-active will-data) ERR_WILL_NOT_FOUND)
+    (asserts! (not (get is-deceased status)) ERR_NOT_DECEASED)
+    
+    (if (> remaining-amount u0)
+      (try! (as-contract (stx-transfer? remaining-amount tx-sender testator)))
+      true
+    )
+    
+    (map-set distribution-schedules
+      { testator: testator, beneficiary: beneficiary }
+      (merge distribution { is-active: false, remaining-amount: u0 })
+    )
+    
+    (ok remaining-amount)
+  )
+)
+
+(define-public (emergency-release-all (testator principal) (beneficiary principal))
+  (let (
+    (current-block stacks-block-height)
+    (distribution (unwrap! (map-get? distribution-schedules { testator: testator, beneficiary: beneficiary }) ERR_DISTRIBUTION_NOT_FOUND))
+    (will-data (unwrap! (map-get? wills { testator: testator }) ERR_WILL_NOT_FOUND))
+    (status (unwrap! (map-get? testator-status { testator: testator }) ERR_WILL_NOT_FOUND))
+    (remaining-amount (get remaining-amount distribution))
+    (release-id (var-get next-release-id))
+  )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (get is-active distribution) ERR_DISTRIBUTION_NOT_FOUND)
+    (asserts! (get is-active will-data) ERR_WILL_NOT_FOUND)
+    (asserts! (get is-deceased status) ERR_NOT_DECEASED)
+    (asserts! (> remaining-amount u0) ERR_DISTRIBUTION_EXHAUSTED)
+    
+    (try! (as-contract (stx-transfer? remaining-amount tx-sender beneficiary)))
+    
+    (map-set distribution-schedules
+      { testator: testator, beneficiary: beneficiary }
+      (merge distribution { remaining-amount: u0, is-active: false })
+    )
+    
+    (map-set distribution-history
+      { testator: testator, beneficiary: beneficiary, release-id: release-id }
+      { amount: remaining-amount, released-at: current-block, block-height: current-block }
+    )
+    
+    (var-set next-release-id (+ release-id u1))
+    (ok remaining-amount)
+  )
+)
+
+(define-read-only (get-distribution-schedule (testator principal) (beneficiary principal))
+  (map-get? distribution-schedules { testator: testator, beneficiary: beneficiary })
+)
+
+(define-read-only (get-distribution-history (testator principal) (beneficiary principal) (release-id uint))
+  (map-get? distribution-history { testator: testator, beneficiary: beneficiary, release-id: release-id })
+)
+
+(define-read-only (get-beneficiary-conditions (testator principal) (beneficiary principal))
+  (map-get? beneficiary-conditions { testator: testator, beneficiary: beneficiary })
+)
+
+(define-read-only (get-next-release-block (testator principal) (beneficiary principal))
+  (match (map-get? distribution-schedules { testator: testator, beneficiary: beneficiary })
+    distribution (some (get next-release-block distribution))
+    none
+  )
+)
+
+(define-read-only (get-remaining-distribution (testator principal) (beneficiary principal))
+  (match (map-get? distribution-schedules { testator: testator, beneficiary: beneficiary })
+    distribution (some (get remaining-amount distribution))
+    none
+  )
+)
+
+(define-read-only (is-distribution-claimable (testator principal) (beneficiary principal))
+  (match (map-get? distribution-schedules { testator: testator, beneficiary: beneficiary })
+    distribution 
+      (let (
+        (current-block stacks-block-height)
+        (conditions (map-get? beneficiary-conditions { testator: testator, beneficiary: beneficiary }))
+        (conditions-met (match conditions
+          condition-data (get conditions-met condition-data)
+          true
+        ))
+      )
+        (and 
+          (get is-active distribution)
+          (> (get remaining-amount distribution) u0)
+          (>= current-block (get next-release-block distribution))
+          conditions-met
+        )
+      )
+    false
+  )
 )
