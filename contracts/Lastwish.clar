@@ -21,6 +21,10 @@
 (define-constant ERR_INVALID_SCHEDULE (err u119))
 (define-constant ERR_SCHEDULE_NOT_FOUND (err u120))
 (define-constant ERR_INVALID_DISTRIBUTION_TYPE (err u121))
+(define-constant ERR_MESSAGE_NOT_FOUND (err u122))
+(define-constant ERR_MESSAGE_ALREADY_EXISTS (err u123))
+(define-constant ERR_MESSAGE_NOT_ACCESSIBLE (err u124))
+(define-constant ERR_INVALID_MESSAGE_TYPE (err u125))
 
 (define-map wills
   { testator: principal }
@@ -113,7 +117,33 @@
   }
 )
 
+;; Legacy Message System
+(define-map legacy-messages
+  { testator: principal, beneficiary: principal, message-id: uint }
+  {
+    message-type: uint, ;; 1=text, 2=media-reference, 3=instruction
+    encrypted-content: (string-ascii 1000),
+    title: (string-ascii 100),
+    is-revealed: bool,
+    revealed-at: uint,
+    created-at: uint,
+    last-updated: uint,
+    access-count: uint,
+    priority: uint ;; 1=low, 2=medium, 3=high, 4=urgent
+  }
+)
+
+(define-map message-access-log
+  { testator: principal, beneficiary: principal, access-id: uint }
+  {
+    accessed-at: uint,
+    access-block: uint,
+    message-count: uint
+  }
+)
+
 (define-data-var next-release-id uint u1)
+(define-data-var next-message-id uint u1)
 
 (define-public (create-will 
   (beneficiaries (list 10 principal))
@@ -729,6 +759,132 @@
   )
 )
 
+;; Legacy Message System Functions
+(define-public (create-legacy-message 
+  (beneficiary principal) 
+  (message-type uint) 
+  (encrypted-content (string-ascii 1000)) 
+  (title (string-ascii 100)) 
+  (priority uint))
+  (let (
+    (testator tx-sender)
+    (message-id (var-get next-message-id))
+    (current-block stacks-block-height)
+    (will-data (unwrap! (map-get? wills { testator: testator }) ERR_WILL_NOT_FOUND))
+    (status (unwrap! (map-get? testator-status { testator: testator }) ERR_WILL_NOT_FOUND))
+  )
+    (asserts! (get is-active will-data) ERR_WILL_NOT_FOUND)
+    (asserts! (not (get is-deceased status)) ERR_NOT_DECEASED)
+    (asserts! (is-some (get-inheritance-amount testator beneficiary)) ERR_INVALID_BENEFICIARY)
+    (asserts! (and (>= message-type u1) (<= message-type u3)) ERR_INVALID_MESSAGE_TYPE)
+    (asserts! (and (>= priority u1) (<= priority u4)) ERR_INVALID_MESSAGE_TYPE)
+    
+    (map-set legacy-messages
+      { testator: testator, beneficiary: beneficiary, message-id: message-id }
+      {
+        message-type: message-type,
+        encrypted-content: encrypted-content,
+        title: title,
+        is-revealed: false,
+        revealed-at: u0,
+        created-at: current-block,
+        last-updated: current-block,
+        access-count: u0,
+        priority: priority
+      }
+    )
+    
+    (var-set next-message-id (+ message-id u1))
+    (ok message-id)
+  )
+)
+
+(define-public (update-legacy-message 
+  (beneficiary principal) 
+  (message-id uint) 
+  (encrypted-content (string-ascii 1000)) 
+  (title (string-ascii 100)) 
+  (priority uint))
+  (let (
+    (testator tx-sender)
+    (current-block stacks-block-height)
+    (message-key { testator: testator, beneficiary: beneficiary, message-id: message-id })
+    (existing-message (unwrap! (map-get? legacy-messages message-key) ERR_MESSAGE_NOT_FOUND))
+    (will-data (unwrap! (map-get? wills { testator: testator }) ERR_WILL_NOT_FOUND))
+    (status (unwrap! (map-get? testator-status { testator: testator }) ERR_WILL_NOT_FOUND))
+  )
+    (asserts! (get is-active will-data) ERR_WILL_NOT_FOUND)
+    (asserts! (not (get is-deceased status)) ERR_NOT_DECEASED)
+    (asserts! (not (get is-revealed existing-message)) ERR_MESSAGE_NOT_ACCESSIBLE)
+    (asserts! (and (>= priority u1) (<= priority u4)) ERR_INVALID_MESSAGE_TYPE)
+    
+    (map-set legacy-messages
+      message-key
+      (merge existing-message {
+        encrypted-content: encrypted-content,
+        title: title,
+        priority: priority,
+        last-updated: current-block
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (reveal-legacy-message (testator principal) (message-id uint))
+  (let (
+    (beneficiary tx-sender)
+    (current-block stacks-block-height)
+    (message-key { testator: testator, beneficiary: beneficiary, message-id: message-id })
+    (message-data (unwrap! (map-get? legacy-messages message-key) ERR_MESSAGE_NOT_FOUND))
+    (will-data (unwrap! (map-get? wills { testator: testator }) ERR_WILL_NOT_FOUND))
+    (status (unwrap! (map-get? testator-status { testator: testator }) ERR_WILL_NOT_FOUND))
+    (access-id (get access-count message-data))
+  )
+    (asserts! (get is-active will-data) ERR_WILL_NOT_FOUND)
+    (asserts! (get is-deceased status) ERR_NOT_DECEASED)
+    (asserts! (not (get is-revealed message-data)) ERR_MESSAGE_NOT_ACCESSIBLE)
+    
+    (map-set legacy-messages
+      message-key
+      (merge message-data {
+        is-revealed: true,
+        revealed-at: current-block,
+        access-count: (+ (get access-count message-data) u1)
+      })
+    )
+    
+    (map-set message-access-log
+      { testator: testator, beneficiary: beneficiary, access-id: access-id }
+      {
+        accessed-at: current-block,
+        access-block: current-block,
+        message-count: u1
+      }
+    )
+    
+    (ok (get encrypted-content message-data))
+  )
+)
+
+(define-public (delete-legacy-message (beneficiary principal) (message-id uint))
+  (let (
+    (testator tx-sender)
+    (message-key { testator: testator, beneficiary: beneficiary, message-id: message-id })
+    (message-data (unwrap! (map-get? legacy-messages message-key) ERR_MESSAGE_NOT_FOUND))
+    (will-data (unwrap! (map-get? wills { testator: testator }) ERR_WILL_NOT_FOUND))
+    (status (unwrap! (map-get? testator-status { testator: testator }) ERR_WILL_NOT_FOUND))
+  )
+    (asserts! (get is-active will-data) ERR_WILL_NOT_FOUND)
+    (asserts! (not (get is-deceased status)) ERR_NOT_DECEASED)
+    (asserts! (not (get is-revealed message-data)) ERR_MESSAGE_NOT_ACCESSIBLE)
+    
+    (map-delete legacy-messages message-key)
+    (ok true)
+  )
+)
+
 (define-public (emergency-release-all (testator principal) (beneficiary principal))
   (let (
     (current-block stacks-block-height)
@@ -806,5 +962,53 @@
         )
       )
     false
+  )
+)
+
+;; Legacy Message System Read-Only Functions
+(define-read-only (get-legacy-message (testator principal) (beneficiary principal) (message-id uint))
+  (map-get? legacy-messages { testator: testator, beneficiary: beneficiary, message-id: message-id })
+)
+
+(define-read-only (get-message-access-log (testator principal) (beneficiary principal) (access-id uint))
+  (map-get? message-access-log { testator: testator, beneficiary: beneficiary, access-id: access-id })
+)
+
+(define-read-only (get-available-messages-count (testator principal) (beneficiary principal))
+  ;; Simplified count - in real implementation would iterate through messages
+  (if (is-some (map-get? wills { testator: testator }))
+    u1 ;; Placeholder count
+    u0
+  )
+)
+
+(define-read-only (is-message-accessible (testator principal) (beneficiary principal) (message-id uint))
+  (match (map-get? legacy-messages { testator: testator, beneficiary: beneficiary, message-id: message-id })
+    message-data
+      (match (map-get? testator-status { testator: testator })
+        status
+          (and 
+            (get is-deceased status)
+            (not (get is-revealed message-data))
+            (is-some (get-inheritance-amount testator beneficiary))
+          )
+        false
+      )
+    false
+  )
+)
+
+(define-read-only (get-message-summary (testator principal) (beneficiary principal) (message-id uint))
+  (match (map-get? legacy-messages { testator: testator, beneficiary: beneficiary, message-id: message-id })
+    message-data
+      (some {
+        title: (get title message-data),
+        message-type: (get message-type message-data),
+        priority: (get priority message-data),
+        created-at: (get created-at message-data),
+        is-revealed: (get is-revealed message-data),
+        access-count: (get access-count message-data)
+      })
+    none
   )
 )
